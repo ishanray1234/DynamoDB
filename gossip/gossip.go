@@ -1,9 +1,11 @@
 package gossip
 
 import (
+	"bufio"
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -60,8 +62,12 @@ func (n *GossipNode) listen() {
 		}
 
 		var msg string
-		fmt.Fscan(conn, &msg)
-		fmt.Fprintf(conn, "ACK from %s\n", n.ID)
+		reader := bufio.NewReader(conn)
+		msg, _ = reader.ReadString('\n')
+		msg = strings.TrimSpace(msg)
+		fmt.Printf("xNode %s received gossip from %s\n", n.ID, msg)
+
+		fmt.Fprintf(conn, "AaCK from %s\n", n.ID)
 		conn.Close()
 
 		n.Mu.Lock()
@@ -109,9 +115,13 @@ func (n *GossipNode) sendGossip(target *NodeInfo) {
 		n.Mu.Unlock()
 		return
 	}
-	fmt.Fprintf(conn, "%s\n", n.ID)
-	fmt.Printf("Gossip sent from %s to %s\n", n.ID, target.ID)
 	defer conn.Close()
 
-	fmt.Fprintln(conn, n.ID)
+	fmt.Fprintf(conn, "%s\n", n.ID)
+	fmt.Printf("Gossip sent from %s to %s\n", n.ID, target.ID)
+
+	// Wait for ACK
+	reader := bufio.NewReader(conn)
+	ack, _ := reader.ReadString('\n') // Read till newline
+	fmt.Printf("ACK received at %s from %s: %s", n.ID, target.ID, ack)
 }
