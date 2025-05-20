@@ -11,7 +11,7 @@ func main() {
 	// node.Peers["Node2"] = &gossip.NodeInfo{
 	// 	ID: "Node2", Address: "127.0.0.1:8002", Status: gossip.Alive,
 	// }
-	node := gossip.NewGossipNode("Node2", "127.0.0.1:8002", 3*time.Second)
+	node := gossip.NewGossipNode("Node2", "127.0.0.1:8002", 3*time.Second, 3)
 	node.Peers["Node1"] = &gossip.NodeInfo{
 		ID: "Node1", Address: "127.0.0.1:8001", Status: gossip.Alive,
 	}
