@@ -64,6 +64,8 @@ func (n *GossipNode) Start() {
 		n.gossipLoop()
 	}()
 
+	n.announceSelfOnce()
+
 	go n.listen()
 
 	go func() {
@@ -79,10 +81,40 @@ func (n *GossipNode) Start() {
 	}()
 
 	//Announce self to all known peers after a small delay
-	go func() {
-		time.Sleep(2 * time.Second) // Give listener time to start
-		n.announceSelf()
-	}()
+	// go func() {
+	// 	time.Sleep(2 * time.Second) // Give listener time to start
+	// 	n.announceSelf()
+	// }()
+}
+
+func (node *GossipNode) announceSelfOnce() {
+	fanout := 3 // You can tweak this based on network size
+	peerCount := len(node.Peers)
+
+	if peerCount == 0 {
+		fmt.Println("No peers to announce to.")
+		return
+	}
+
+	// Shuffle peers
+	keys := make([]string, 0, peerCount)
+	for k := range node.Peers {
+		keys = append(keys, k)
+	}
+	shuffled := rand.Perm(peerCount)
+	for i := 0; i < fanout && i < peerCount; i++ {
+		peer := node.Peers[keys[shuffled[i]]]
+		go node.sendGossip(peer) // Send gossip to selected peers
+	}
+
+	fmt.Printf("Announced to %d peer(s) at bootstrap.\n", min(fanout, peerCount))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (n *GossipNode) announceSelf() {
