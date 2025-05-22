@@ -7,8 +7,11 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/ishanray1234/DynamoDB/hashing"
 )
 
 type NodeStatus int
@@ -42,16 +45,25 @@ type GossipNode struct {
 	listener net.Listener // Keep a reference to the listener
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+
+	// Hashing
+	Ring    *hashing.HashRing
+	Storage map[string]string
+	storeMu sync.RWMutex
 }
 
 func NewGossipNode(id, address string, interval time.Duration, fanout int) *GossipNode {
-	return &GossipNode{
+	node := &GossipNode{
 		ID:       id,
 		Address:  address,
 		Peers:    make(map[string]*NodeInfo),
 		Interval: interval,
 		Fanout:   fanout,
+		Ring:     hashing.NewHashRing(3), // 3 virtual nodes per physical node
+		Storage:  make(map[string]string),
 	}
+	// node.Ring.AddNode(id)
+	return node
 }
 
 func (n *GossipNode) Start() {
@@ -117,18 +129,18 @@ func min(a, b int) int {
 	return b
 }
 
-func (n *GossipNode) announceSelf() {
-	n.Mu.RLock()
-	defer n.Mu.RUnlock()
+// func (n *GossipNode) announceSelf() {
+// 	n.Mu.RLock()
+// 	defer n.Mu.RUnlock()
 
-	for id, peer := range n.Peers {
-		if id == n.ID || peer.Status == Dead {
-			continue
-		}
-		fmt.Printf("Node %s announcing itself to %s\n", n.ID, id)
-		go n.sendGossip(peer)
-	}
-}
+// 	for id, peer := range n.Peers {
+// 		if id == n.ID || peer.Status == Dead {
+// 			continue
+// 		}
+// 		fmt.Printf("Node %s announcing itself to %s\n", n.ID, id)
+// 		go n.sendGossip(peer)
+// 	}
+// }
 
 func (n *GossipNode) Stop() {
 	close(n.stopCh)
@@ -165,6 +177,7 @@ func (n *GossipNode) listen() {
 	}
 }
 
+// old Stop function
 // func (n *GossipNode) Stop() {
 // 	close(n.stopCh) // signal stop
 // 	if n.listener != nil {
@@ -173,18 +186,75 @@ func (n *GossipNode) listen() {
 // 	n.wg.Wait() // wait for listen() to exit
 // }
 
+//old handleConnection function
+// func (n *GossipNode) handleConnection(conn net.Conn) {
+// 	defer conn.Close()
+// 	reader := bufio.NewReader(conn)
+// 	decoder := json.NewDecoder(reader)
+// 	var msg GossipMessage
+// 	if err := decoder.Decode(&msg); err != nil {
+// 		fmt.Println("Failed to decode message")
+// 		return
+// 	}
+// 	fmt.Printf("Node %s received gossip from %s\n", n.ID, msg.SenderID)
+// 	fmt.Fprintf(conn, "ACK from %s\n", n.ID)
+// 	n.mergePeerInfo(msg)
+// }
+
 func (n *GossipNode) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
-	decoder := json.NewDecoder(reader)
-	var msg GossipMessage
-	if err := decoder.Decode(&msg); err != nil {
-		fmt.Println("Failed to decode message")
+
+	command, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Println(command)
+		fmt.Println("Failed to read command:", err)
 		return
 	}
-	fmt.Printf("Node %s received gossip from %s\n", n.ID, msg.SenderID)
-	fmt.Fprintf(conn, "ACK from %s\n", n.ID)
-	n.mergePeerInfo(msg)
+	// command = command[:len(command)-1] // remove newline
+	command = strings.TrimSpace(command)
+	// print("Command received: ", command)
+
+	decoder := json.NewDecoder(reader)
+	switch command {
+	case "STORE":
+		var req StoreRequest
+		if err := decoder.Decode(&req); err != nil {
+			fmt.Println("Failed to decode STORE request:", err)
+			return
+		}
+		n.storeKey(req.Key, req.Value)
+		fmt.Fprintln(conn, "STORED")
+
+	case "RETRIEVE":
+		var req RetrieveRequest
+		if err := decoder.Decode(&req); err != nil {
+			fmt.Println("Failed to decode RETRIEVE request:", err)
+			return
+		}
+		val, found := n.retrieveKey(req.Key)
+		resp := RetrieveResponse{Value: val, Found: found}
+		json.NewEncoder(conn).Encode(resp)
+
+	default:
+		var msg GossipMessage
+		if err := decoder.Decode(&msg); err != nil {
+			fmt.Println("Failed to decode gossip message")
+			return
+		}
+		fmt.Printf("Node %s received gossip from %s\n", n.ID, msg.SenderID)
+		fmt.Fprintf(conn, "ACK from %s\n", n.ID)
+		n.mergePeerInfo(msg)
+	}
+	// decoder := json.NewDecoder(reader)
+	// var msg GossipMessage
+	// if err := decoder.Decode(&msg); err != nil {
+	// 	fmt.Println("Failed to decode message")
+	// 	return
+	// }
+	// fmt.Printf("Node %s received gossip from %s\n", n.ID, msg.SenderID)
+	// fmt.Fprintf(conn, "ACK from %s\n", n.ID)
+	// n.mergePeerInfo(msg)
 }
 
 func (n *GossipNode) gossipLoop() {
@@ -230,6 +300,7 @@ func (n *GossipNode) sendGossip(target *NodeInfo) {
 		Peers:      n.copyPeers(),
 	}
 
+	fmt.Fprintln(conn, "GOSSIP")
 	encoder := json.NewEncoder(conn)
 	if err := encoder.Encode(msg); err != nil {
 		fmt.Println("Failed to send gossip")
@@ -275,6 +346,7 @@ func (n *GossipNode) updatePeer(id, address string, status NodeStatus) {
 			Status:   status,
 			LastSeen: time.Now(),
 		}
+		n.Ring.AddNode(id)
 	} else {
 		peer.Status = status
 		peer.LastSeen = time.Now()
@@ -301,6 +373,208 @@ func (n *GossipNode) checkForDeadNodes(timeout time.Duration) {
 		if time.Since(peer.LastSeen) > timeout && peer.Status != Dead {
 			fmt.Printf("Node %s marking %s as Dead\n", n.ID, peer.ID)
 			peer.Status = Dead
+			n.Ring.RemoveNode(peer.ID)
+
+			// fmt.Printf("Node %s rebalancing data from %s\n", n.ID, peer.ID)
+			// deadNodeData := n.getDataForNode(peer.ID) // You need to implement this to fetch keys stored on dead node
+			// //print deadNodeData data
+			// fmt.Println("deadNodeData:", deadNodeData)
+			// n.RebalanceData(peer.ID, deadNodeData)
 		}
 	}
 }
+
+// *********STORE IMPLEMENTATION*********//
+type StoreRequest struct {
+	Key   string
+	Value string
+}
+
+type RetrieveRequest struct {
+	Key string
+}
+
+type RetrieveResponse struct {
+	Value string
+	Found bool
+}
+
+func (n *GossipNode) BuildHashRing() {
+	n.Ring = hashing.NewHashRing(3) // Re-initialize ring
+	n.Ring.AddNode(n.ID)
+	for peerID := range n.Peers {
+		n.Ring.AddNode(peerID)
+	}
+}
+
+func (n *GossipNode) storeKey(key, value string) {
+	n.storeMu.Lock()
+	defer n.storeMu.Unlock()
+	n.Storage[key] = value
+}
+
+func (n *GossipNode) retrieveKey(key string) (string, bool) {
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
+	val, ok := n.Storage[key]
+	fmt.Println("n:", n.ID)
+	fmt.Println("val:", val)
+	return val, ok
+}
+
+func (n *GossipNode) Store(key, value string, m int) error {
+	replicaNodes := n.Ring.GetNodes(key, m)
+	for _, nodeID := range replicaNodes {
+		if nodeID == n.ID {
+			n.storeKey(key, value)
+			continue
+		}
+		peer, ok := n.Peers[nodeID]
+		if !ok || peer.Status != Alive {
+			fmt.Printf("peer %s not available for storing key %s\n", nodeID, key)
+			continue
+		}
+		conn, err := net.Dial("tcp", peer.Address)
+		if err != nil {
+			fmt.Printf("Failed to connect to %s: %v\n", peer.ID, err)
+			continue
+		}
+		fmt.Fprintln(conn, "STORE")
+		json.NewEncoder(conn).Encode(StoreRequest{Key: key, Value: value})
+		ack, _ := bufio.NewReader(conn).ReadString('\n')
+		conn.Close()
+		if ack != "STORED\n" {
+			fmt.Printf("Failed to store on node %s\n", nodeID)
+		}
+	}
+	return nil
+}
+
+func (n *GossipNode) Retrieve(key string, m int) (string, error) {
+	replicaNodes := n.Ring.GetNodes(key, m)
+	fmt.Println("replicaNodes:", replicaNodes)
+	for _, nodeID := range replicaNodes {
+		if nodeID == n.ID {
+			val, ok := n.retrieveKey(key)
+			if ok {
+				return val, nil
+			}
+			continue
+		}
+		peer, ok := n.Peers[nodeID]
+		if !ok || peer.Status != Alive {
+			continue
+		}
+		conn, err := net.Dial("tcp", peer.Address)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintln(conn, "RETRIEVE")
+		json.NewEncoder(conn).Encode(RetrieveRequest{Key: key})
+
+		var resp RetrieveResponse
+		err = json.NewDecoder(conn).Decode(&resp)
+		conn.Close()
+		if err == nil && resp.Found {
+			return resp.Value, nil
+		}
+	}
+	return "", fmt.Errorf("key not found in any of the %d replicas", m)
+}
+
+//single hashing function
+// func (n *GossipNode) Store(key, value string) error {
+// 	responsibleNode := n.Ring.GetNodes(key)
+// 	if responsibleNode == n.ID {
+// 		n.storeKey(key, value)
+// 		return nil
+// 	}
+// 	peer, ok := n.Peers[responsibleNode]
+// 	if !ok || peer.Status != Alive {
+// 		return fmt.Errorf("responsible node %s not available", responsibleNode)
+// 	}
+// 	conn, err := net.Dial("tcp", peer.Address)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer conn.Close()
+
+// 	fmt.Fprintln(conn, "STORE")
+// 	json.NewEncoder(conn).Encode(StoreRequest{Key: key, Value: value})
+// 	ack, _ := bufio.NewReader(conn).ReadString('\n')
+// 	if ack != "STORED\n" {
+// 		return fmt.Errorf("failed to store on node %s", responsibleNode)
+// 	}
+// 	return nil
+// }
+
+// func (n *GossipNode) Retrieve(key string) (string, error) {
+// 	responsibleNode := n.Ring.GetNode(key)
+// 	fmt.Println("ID & responsibleNode:", n.ID, responsibleNode)
+// 	if responsibleNode == n.ID {
+// 		fmt.Println("responsibleNode == n.ID")
+// 		val, ok := n.retrieveKey(key)
+// 		if !ok {
+// 			return "", fmt.Errorf("1.key not found")
+// 		}
+// 		return val, nil
+// 	}
+// 	peer, ok := n.Peers[responsibleNode]
+// 	if !ok || peer.Status != Alive {
+// 		return "", fmt.Errorf("responsible node %s not available", responsibleNode)
+// 	}
+// 	conn, err := net.Dial("tcp", peer.Address)
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	defer conn.Close()
+
+// 	fmt.Fprintln(conn, "RETRIEVE")
+// 	json.NewEncoder(conn).Encode(RetrieveRequest{Key: key})
+
+// 	var resp RetrieveResponse
+// 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+// 		return "", err
+// 	}
+// 	if !resp.Found {
+// 		return "", fmt.Errorf("2.key not found")
+// 	}
+// 	return resp.Value, nil
+// }
+
+// func (n *GossipNode) getDataForNode(nodeID string) map[string]string {
+// 	n.storeMu.RLock()
+// 	defer n.storeMu.RUnlock()
+
+// 	data := make(map[string]string)
+// 	for key, value := range n.Storage {
+// 		if n.Ring.GetNode(key) == nodeID {
+// 			data[key] = value
+// 		}
+// 	}
+// 	return data
+// }
+
+// func (n *GossipNode) RebalanceData(removedNodeID string, removedData map[string]string) {
+// 	for key, value := range removedData {
+// 		newOwner := n.Ring.GetNode(key)
+// 		if newOwner == n.ID {
+// 			n.storeKey(key, value)
+// 		} else if peer, ok := n.Peers[newOwner]; ok && peer.Status == Alive {
+// 			conn, err := net.Dial("tcp", peer.Address)
+// 			if err != nil {
+// 				fmt.Printf("Failed to connect to %s during rebalance: %v\n", newOwner, err)
+// 				continue
+// 			}
+
+// 			fmt.Fprintln(conn, "STORE")
+// 			json.NewEncoder(conn).Encode(StoreRequest{Key: key, Value: value})
+// 			ack, _ := bufio.NewReader(conn).ReadString('\n')
+// 			if ack != "STORED\n" {
+// 				fmt.Printf("Failed to store %s on new owner %s\n", key, newOwner)
+// 			}
+// 			fmt.Printf("Rebalanced %s to %s\n", key, newOwner)
+// 			conn.Close()
+// 		}
+// 	}
+// }
