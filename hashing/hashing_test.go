@@ -38,18 +38,12 @@ func createTestCluster(t *testing.T, count int, basePort int, replicationFactor 
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	time.Sleep(4 * time.Second) // allow gossip to converge
+	// time.Sleep(2 * time.Second) // allow gossip to converge
 	return nodes
 }
 
 func TestReplicationAndRecoveryAfterFailure(t *testing.T) {
 	nodes := createTestCluster(t, 5, 9200, 3)
-
-	// defer func() {
-	// 	for _, n := range nodes {
-	// 		n.Stop()
-	// 	}
-	// }()
 
 	//run the BuildHashRing function on all nodes
 	for _, node := range nodes {
@@ -66,16 +60,6 @@ func TestReplicationAndRecoveryAfterFailure(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// storeReq := gossip.StoreRequest{Key: key, Value: value}
-	// storeData, _ := json.Marshal(storeReq)
-
-	// if _, err = conn.Write([]byte("STORE\n")); err != nil {
-	// 	t.Fatalf("Send STORE command failed: %v", err)
-	// }
-	// if _, err = conn.Write(storeData); err != nil {
-	// 	t.Fatalf("Send STORE data failed: %v", err)
-	// }
-
 	err = nodes[0].Store(key, value, 3)
 	if err != nil {
 		t.Fatalf("Store failed: %v", err)
@@ -89,14 +73,14 @@ func TestReplicationAndRecoveryAfterFailure(t *testing.T) {
 	} else {
 		println("Successfully stored value on node[0]:", val)
 	}
-	time.Sleep(2 * time.Second) // replication window
+	// time.Sleep(2 * time.Second) // replication window
 
 	// Step 2: Kill node[0]
 	nodes[4].Stop()
 	fmt.Println("Simulated failure: node stopped")
 	// t.Log("Simulated failure: node[0] stopped")
 
-	time.Sleep(8 * time.Second) // wait for gossip update
+	time.Sleep(2 * time.Second) // wait for gossip update
 
 	// Step 3: Retrieve from node[3]
 	conn2, err := net.Dial("tcp", nodes[2].Address)
@@ -104,16 +88,6 @@ func TestReplicationAndRecoveryAfterFailure(t *testing.T) {
 		t.Fatalf("Connect to node[2] failed: %v", err)
 	}
 	defer conn2.Close()
-
-	// retrieveReq := gossip.RetrieveRequest{Key: key}
-	// retrieveData, _ := json.Marshal(retrieveReq)
-
-	// if _, err = conn2.Write([]byte("RETRIEVE\n")); err != nil {
-	// 	t.Fatalf("Send RETRIEVE command failed: %v", err)
-	// }
-	// if _, err = conn2.Write(retrieveData); err != nil {
-	// 	t.Fatalf("Send RETRIEVE payload failed: %v", err)
-	// }
 
 	val, err = nodes[2].Retrieve(key, 3)
 	if err != nil {
@@ -125,18 +99,55 @@ func TestReplicationAndRecoveryAfterFailure(t *testing.T) {
 		t.Logf("Successfully retrieved value from node[3]: %s", val)
 	}
 
-	// var resp gossip.RetrieveResponse
-	// decoder := json.NewDecoder(conn2)
-	// if err := decoder.Decode(&resp); err != nil {
-	// 	t.Fatalf("Decode response failed: %v", err)
+	// Step 4: Update the value for the same key
+	// updatedValue := "updatedHighAvailability"
+	// err = nodes[1].Update(key, updatedValue, 3)
+	// if err != nil {
+	// 	t.Fatalf("Update failed: %v", err)
+	// }
+	// time.Sleep(2 * time.Second) // give time for replication
+
+	// Step 5: Retrieve from node[1] to confirm update
+	// val, err = nodes[1].Retrieve(key, 3)
+	// if err != nil {
+	// 	t.Fatalf("Retrieve after update failed: %v", err)
+	// }
+	// if val != updatedValue {
+	// 	t.Fatalf("Update failed, expected %q, got %q", updatedValue, val)
+	// } else {
+	// 	t.Logf("Update confirmed on node[1]: %s", val)
 	// }
 
-	// if !resp.Found {
-	// 	t.Fatal("Key not found in surviving node")
+	// Step 6: Delete the key from all replicas
+	// err = nodes[2].Delete(key, 3)
+	// if err != nil {
+	// 	t.Fatalf("Delete failed: %v", err)
 	// }
-	// if resp.Value != value {
-	// 	t.Errorf("Expected %q, got %q", value, resp.Value)
+	// time.Sleep(1 * time.Second) // allow deletion to propagate
+
+	// Step 7: Try retrieving again (should fail)
+	// _, err = nodes[3].Retrieve(key, 3)
+	// if err == nil {
+	// 	t.Fatalf("Expected error on retrieving deleted key, but got value")
 	// } else {
-	// 	t.Logf("Successfully retrieved value from node[3]: %s", resp.Value)
+	// 	t.Logf("Confirmed deletion on node[3], retrieve error: %v", err)
 	// }
+
+	// add values in node 1
+	nodes[1].Store("key1", "value1", 3)
+	nodes[1].Store("key2", "value2", 3)
+	nodes[1].Store("key3", "value3", 3)
+	nodes[2].Store("key4", "value4", 3)
+
+	val, err = nodes[1].Retrieve("key1", 3)
+	if err != nil {
+		t.Fatalf("Retrieve failed: %v", err)
+	} else {
+		t.Logf("Successfully retrieved value from node[1]: %s", val)
+	}
+
+	// Step 8: Print all key-values from node[1]
+	allData := nodes[0].GetAllLocalData()
+	t.Logf("All local data on node: %+v", allData)
+
 }

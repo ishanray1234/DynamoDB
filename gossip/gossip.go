@@ -236,6 +236,12 @@ func (n *GossipNode) handleConnection(conn net.Conn) {
 		resp := RetrieveResponse{Value: val, Found: found}
 		json.NewEncoder(conn).Encode(resp)
 
+	case "DELETE":
+		var req DeleteRequest
+		json.NewDecoder(conn).Decode(&req)
+		n.deleteKey(req.Key)
+		fmt.Fprintln(conn, "DELETED")
+
 	default:
 		var msg GossipMessage
 		if err := decoder.Decode(&msg); err != nil {
@@ -399,6 +405,10 @@ type RetrieveResponse struct {
 	Found bool
 }
 
+type DeleteRequest struct {
+	Key string
+}
+
 func (n *GossipNode) BuildHashRing() {
 	n.Ring = hashing.NewHashRing(3) // Re-initialize ring
 	n.Ring.AddNode(n.ID)
@@ -451,6 +461,7 @@ func (n *GossipNode) Store(key, value string, m int) error {
 }
 
 func (n *GossipNode) Retrieve(key string, m int) (string, error) {
+	fmt.Println("Retrieve key:", key)
 	replicaNodes := n.Ring.GetNodes(key, m)
 	fmt.Println("replicaNodes:", replicaNodes)
 	for _, nodeID := range replicaNodes {
@@ -480,6 +491,91 @@ func (n *GossipNode) Retrieve(key string, m int) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("key not found in any of the %d replicas", m)
+}
+
+func (n *GossipNode) Delete(key string, m int) error {
+	fmt.Println("Delete key:", key)
+	replicaNodes := n.Ring.GetNodes(key, m) // returns m nodes
+
+	for _, nodeID := range replicaNodes {
+		if nodeID == n.ID {
+			n.deleteKey(key)
+			continue
+		}
+		peer, ok := n.Peers[nodeID]
+		if !ok || peer.Status != Alive {
+			continue
+		}
+		conn, err := net.Dial("tcp", peer.Address)
+		if err != nil {
+			fmt.Printf("Delete: failed to connect to %s: %v\n", peer.ID, err)
+			continue
+		}
+		defer conn.Close()
+
+		fmt.Fprintln(conn, "DELETE")
+		err = json.NewEncoder(conn).Encode(DeleteRequest{Key: key})
+		if err != nil {
+			fmt.Printf("Delete: failed to encode request for %s: %v\n", peer.ID, err)
+			continue
+		}
+		ack, _ := bufio.NewReader(conn).ReadString('\n')
+		if ack != "DELETED\n" {
+			fmt.Printf("Delete: failed to delete on node %s\n", nodeID)
+		}
+		fmt.Printf("Delete: deleted key %s from node %s\n", key, nodeID)
+	}
+	return nil
+}
+
+func (n *GossipNode) deleteKey(key string) {
+	n.storeMu.Lock()
+	defer n.storeMu.Unlock()
+	delete(n.Storage, key)
+}
+
+func (n *GossipNode) Update(key, newValue string, m int) error {
+	replicaNodes := n.Ring.GetNodes(key, m)
+
+	for _, nodeID := range replicaNodes {
+		if nodeID == n.ID {
+			n.storeKey(key, newValue)
+			continue
+		}
+		peer, ok := n.Peers[nodeID]
+		if !ok || peer.Status != Alive {
+			continue
+		}
+		conn, err := net.Dial("tcp", peer.Address)
+		if err != nil {
+			fmt.Printf("Update: failed to connect to %s: %v\n", peer.ID, err)
+			continue
+		}
+		defer conn.Close()
+
+		fmt.Fprintln(conn, "STORE")
+		json.NewEncoder(conn).Encode(StoreRequest{Key: key, Value: newValue})
+		ack, _ := bufio.NewReader(conn).ReadString('\n')
+		if ack != "STORED\n" {
+			fmt.Printf("Update: failed to store on node %s\n", nodeID)
+		}
+	}
+	return nil
+}
+
+func (n *GossipNode) GetAllLocalData() map[string]string {
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
+	fmt.Println("GetAllLocalData n.Storage:", n.Storage)
+	result := make(map[string]string)
+
+	// maps.Copy(result, n.Storage)
+	for key, value := range n.Storage {
+		result[key] = value
+		fmt.Println(":", key, value)
+	}
+
+	return result
 }
 
 //single hashing function
